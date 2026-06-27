@@ -7,10 +7,6 @@ import app.revanced.manager.downloader.Downloader
 import app.revanced.manager.downloader.download
 import dev.syrupderg.reflect.shared.Merger
 import dev.syrupderg.reflect.R
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
@@ -18,7 +14,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.Jsoup
 import java.nio.file.Files
-import java.nio.file.Path
 import java.util.UUID
 import java.util.zip.ZipFile
 import kotlin.io.path.ExperimentalPathApi
@@ -52,7 +47,7 @@ private val noRedirectClient by lazy {
     sharedClient.newBuilder().followRedirects(false).build()
 }
 
-@OptIn(ExperimentalPathApi::class, DelicateCoroutinesApi::class)
+@OptIn(ExperimentalPathApi::class)
 val ReflectDownloader = Downloader(R.string.reflect) {
 
     get { packageName, version ->
@@ -134,9 +129,7 @@ val ReflectDownloader = Downloader(R.string.reflect) {
                         "$trueDownloadUrl#type=apk"
                     }
                 }
-            } catch (e: Exception) {
-                // Ignore API failure, targetUrl will remain null
-            }
+            } catch (e: Exception) {}
 
         if (targetUrl == null) throw Exception("Could not find a download link for $packageName version $version")
         DownloadUrl(targetUrl!!) to resolvedVersion
@@ -144,60 +137,51 @@ val ReflectDownloader = Downloader(R.string.reflect) {
 
     download { downloadUrl, outputStream ->
         val isApk = downloadUrl.url.endsWith("#type=apk")
+        
         if (isApk) {
-            val (inputStream, size) = downloadUrl.toDownloadResult()
+            val (inputStream, _) = downloadUrl.toDownloadResult()
             inputStream.use { stream ->
-                if (size != null) reportSize(size)
-                val buffer = ByteArray(64 * 1024)
-                var bytes = stream.read(buffer)
-                while (bytes >= 0) {
-                    outputStream.write(buffer, 0, bytes)
-                    bytes = stream.read(buffer)
-                }
+                stream.copyTo(outputStream, 128 * 1024)
             }
         } else {
-            val workingDir: Path = Files.createTempDirectory("reflect_dl")
+            val workingPath = Files.createTempDirectory("reflect_dl")
             try {
-                val downloadedFile: Path = workingDir.resolve(UUID.randomUUID().toString()).also { file ->
-                    file.outputStream().use { output ->
-                        val (inputStream, size) = downloadUrl.toDownloadResult()
-                        inputStream.use { stream ->
-                            if (size != null) reportSize(size)
-                            val buffer = ByteArray(64 * 1024)
-                            var bytes = stream.read(buffer)
-                            while (bytes >= 0) {
-                                output.write(buffer, 0, bytes)
-                                bytes = stream.read(buffer)
-                            }
-                        }
+                val downloadedZipPath = workingPath.resolve(UUID.randomUUID().toString())
+                
+                downloadedZipPath.outputStream().use { output ->
+                    val (inputStream, _) = downloadUrl.toDownloadResult()
+                    inputStream.use { stream ->
+                        stream.copyTo(output, 128 * 1024)
                     }
                 }
-                val xapkWorkingDir: Path = workingDir.resolve("xapk").also { it.toFile().mkdirs() }
-                ZipFile(downloadedFile.toFile()).use { zip ->
+                
+                val xapkWorkingPath = workingPath.resolve("xapk").also { it.toFile().mkdirs() }
+                
+                ZipFile(downloadedZipPath.toFile()).use { zip ->
                     val rawApkEntries = zip.entries().asSequence()
                         .filter { !it.isDirectory && it.name.endsWith(".apk") }
                         .map { it.name }
                         .toList()
 
                     val activity = SplitSelector.getCurrentActivity()
-                    if (activity == null) throw Exception("Activity not found, cannot select splits.")
+                        ?: throw Exception("Activity not found, cannot select splits.")
+                        
                     val userSelectedSplits = SplitSelector.select(activity, rawApkEntries)
                     if (userSelectedSplits.isEmpty()) throw Exception("Split selection cancelled.")
 
-                    for (split in userSelectedSplits) {
-                        val entry = zip.getEntry(split)
-                        if (entry != null) {
-                            val outputFile = xapkWorkingDir.resolve(entry.name)
-                            outputFile.parent.toFile().mkdirs()
-                            zip.getInputStream(entry).use { input -> Files.copy(input, outputFile) }
+                    userSelectedSplits.forEach { split ->
+                        zip.getEntry(split)?.let { entry ->
+                            val extractedApkPath = xapkWorkingPath.resolve(entry.name)
+                            extractedApkPath.parent.toFile().mkdirs()
+                            zip.getInputStream(entry).use { input -> 
+                                Files.copy(input, extractedApkPath) 
+                            }
                         }
                     }
                 }
-                Merger.mergeAndWrite(xapkWorkingDir, outputStream)
+                Merger.mergeAndWrite(xapkWorkingPath, outputStream)
             } finally {
-                GlobalScope.launch(Dispatchers.IO) {
-                    try { workingDir.deleteRecursively() } catch (e: Exception) {}
-                }
+                runCatching { workingPath.deleteRecursively() }
             }
         }
     }
