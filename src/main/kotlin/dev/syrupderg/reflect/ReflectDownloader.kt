@@ -2,15 +2,14 @@
 
 package dev.syrupderg.reflect
 
+import android.util.Log
 import app.revanced.manager.downloader.DownloadUrl
 import app.revanced.manager.downloader.Downloader
 import app.revanced.manager.downloader.download
+import app.revanced.manager.downloader.webview.runWebView
+import dev.syrupderg.reflect.shared.CloudflareHelper
 import dev.syrupderg.reflect.shared.Merger
 import dev.syrupderg.reflect.R
-import okhttp3.Cookie
-import okhttp3.CookieJar
-import okhttp3.HttpUrl
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.Jsoup
 import java.nio.file.Files
@@ -20,127 +19,159 @@ import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.outputStream
 
-private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
-private val cookieJar = object : CookieJar {
-    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-        val host = url.host
-        val list = cookieStore[host] ?: mutableListOf()
-        val newNames = cookies.map { it.name }
-        list.removeAll { it.name in newNames }
-        list.addAll(cookies)
-        cookieStore[host] = list
-    }
-    override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        return cookieStore[url.host] ?: emptyList()
-    }
-}
-
-private val sharedClient by lazy {
-    OkHttpClient.Builder()
-        .cookieJar(cookieJar)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
-}
-
-private val noRedirectClient by lazy {
-    sharedClient.newBuilder().followRedirects(false).build()
-}
-
 @OptIn(ExperimentalPathApi::class)
 val ReflectDownloader = Downloader(R.string.reflect) {
 
     get { packageName, version ->
-        var targetUrl: String? = null
+        var targetUrl: DownloadUrl? = null
         var resolvedVersion = version
-        val isAnyVersion = version.equals("Any", ignoreCase = true) || version.isNullOrBlank()
 
-        try {
-                val apiUrl = android.net.Uri.Builder()
-                    .scheme("https")
-                    .authority("apkmirror-api.syrupderg.workers.dev")
-                    .appendPath("search")
-                    .appendQueryParameter("package", packageName)
-                    .apply { if (!isAnyVersion) appendQueryParameter("version", version) }
-                    .toString()
+        val searchQuery = version?.let { "$packageName $it" } ?: packageName
+        val searchUrl = "https://www.apkmirror.com/?apk_files&s=" + java.net.URLEncoder.encode(searchQuery, "UTF-8")
 
-                val request = Request.Builder().url(apiUrl).build()
-                sharedClient.newCall(request).execute().use { response ->
-                    if (response.code == 404) throw Exception("App not found in API")
-                    if (!response.isSuccessful) throw Exception("API returned HTTP ${response.code}")
-                    val body = response.body?.string() ?: throw Exception("Empty API response")
-                    val json = org.json.JSONObject(body)
-                    if (!json.has("url")) throw Exception("No URL in JSON")
-                    val initialTargetUrl = json.getString("url")
-                    
-                    val userAgent = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.164 Mobile Safari/537.36"
-                    fun fetchHtml(url: String, referer: String? = null): String {
-                        val reqBuilder = Request.Builder()
-                            .url(url)
-                            .header("User-Agent", userAgent)
-                            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-                            .header("Accept-Language", "en-US,en;q=0.9")
-                            .header("Upgrade-Insecure-Requests", "1")
-                            .header("Sec-Fetch-Dest", "document")
-                            .header("Sec-Fetch-Mode", "navigate")
-                            .header("Sec-Fetch-Site", if (referer != null) "same-origin" else "none")
-                        if (referer != null) reqBuilder.header("Referer", referer)
-                        return sharedClient.newCall(reqBuilder.build()).execute().use { res ->
-                            res.body?.string() ?: throw Exception("Empty HTML body")
+        val baseActivity = SplitSelector.getCurrentActivity()
+        val userAgent = CloudflareHelper.getUserAgent(baseActivity)
+
+        var retryCount = 0
+        var needCaptchaSolve = false
+        val maxRetries = 2
+
+        while (targetUrl == null && retryCount <= maxRetries) {
+            try {
+                if (needCaptchaSolve) {
+                    val webViewResult = CloudflareHelper.solveCloudflare(baseActivity) {
+                        runWebView("Solve Captcha") {
+                            download { url, _, ua ->
+                                finish(DownloadUrl(url, mapOf("User-Agent" to ua)))
+                            }
+                            searchUrl
                         }
                     }
+                    if (webViewResult != null) {
+                        targetUrl = webViewResult
+                        break
+                    }
+                    needCaptchaSolve = false
+                }
 
-                    val html1 = fetchHtml(initialTargetUrl)
-                    val doc1 = Jsoup.parse(html1)
-                    val downloadBtn = doc1.selectFirst(".downloadButton") ?: throw Exception("Step 1 Failed")
-                    var intermediatePath = downloadBtn.attr("href").replace("&amp;", "&")
-                    if (!intermediatePath.startsWith("http")) intermediatePath = "https://www.apkmirror.com$intermediatePath"
-                    intermediatePath = intermediatePath.substringBefore("&forcebaseapk")
+                Log.d("ReflectDownloader", "=== Starting headless scrape (Attempt ${retryCount + 1}) ===")
+                var (currentUrl, html) = CloudflareHelper.fetchHtml(searchUrl, userAgent)
+                var currentDoc = Jsoup.parse(html)
+                
+                if (currentUrl.contains("?apk_files") || currentUrl.contains("&s=")) {
+                    val mainContent = currentDoc.selectFirst("#primary") ?: currentDoc.selectFirst(".listWidget") ?: currentDoc
+                    val releaseHref = mainContent.selectFirst("a.infoLink[href*=-release/]")?.attr("href")
+                        ?: mainContent.selectFirst(".appRow a[href*=-release/]")?.attr("href")
+                        ?: throw Exception("No release link found in search results")
+                    
+                    val nextUrl = releaseHref.toAbsoluteApkMirrorUrl()
+                    val res = CloudflareHelper.fetchHtml(nextUrl, userAgent, referer = currentUrl)
+                    currentUrl = res.first
+                    currentDoc = Jsoup.parse(res.second)
+                }
 
-                    val html2 = fetchHtml(intermediatePath, referer = initialTargetUrl)
-                    val doc2 = Jsoup.parse(html2)
-                    val fastLink = doc2.selectFirst("a[href*='/wp-content/themes/APKMirror/download.php']")
-                        ?: doc2.selectFirst("a#download-link")
-                        ?: throw Exception("Step 2 Failed")
+                val variantRows = currentDoc.select(".variants-table .table-row:has(a.accent_color)")
+                if (variantRows.isNotEmpty()) {
+                    Log.d("ReflectDownloader", "[Step 4] Found ${variantRows.size} variants. Executing smart selection.")
 
-                    var finalPath = fastLink.attr("href").replace("&amp;", "&")
-                    if (!finalPath.startsWith("http")) finalPath = "https://www.apkmirror.com$finalPath"
+                    val preferredArchs = listOf("universal", "arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+                    val preferredDpis = listOf("nodpi", "xxhdpi", "xhdpi", "hdpi", "480dpi", "320dpi")
 
-                    val finalReq = Request.Builder()
-                        .url(finalPath)
-                        .header("User-Agent", userAgent)
-                        .header("Referer", intermediatePath)
-                        .build()
+                    val targetRow = variantRows.maxByOrNull { row ->
+                        var score = 0
+                        val badges = row.select(".apkm-badge").map { it.text().trim().uppercase() }
+                        val cells = row.select(".table-cell")
 
-                    var trueDownloadUrl = finalPath
-                    noRedirectClient.newCall(finalReq).execute().use { finalRes ->
-                        if (finalRes.isRedirect) {
-                            val loc = finalRes.header("Location")
-                            if (loc != null) trueDownloadUrl = if (loc.startsWith("http")) loc else "https://www.apkmirror.com$loc"
+                        if (badges.contains("APK") && !badges.contains("BUNDLE")) score += 10000
+
+                        if (cells.size >= 4) {
+                            val archText = cells[1].text().trim().lowercase()
+                            val dpiText = cells[3].text().trim().lowercase()
+
+                            val archIndex = preferredArchs.indexOfFirst { archText.contains(it) }
+                            if (archIndex != -1) score += (1000 - (archIndex * 100))
+
+                            val dpiIndex = preferredDpis.indexOfFirst { dpiText.contains(it) }
+                            if (dpiIndex != -1) score += (10 - dpiIndex)
                         }
+                        score
                     }
 
-                    val urlPath = try { java.net.URI(trueDownloadUrl).path.lowercase() } catch (e: Exception) { trueDownloadUrl.substringBefore("?").lowercase() }
-                    val isApkm = urlPath.endsWith(".apkm") || urlPath.endsWith(".xapk") || urlPath.endsWith(".apks")
-                    
-                    targetUrl = if (isApkm) {
-                        "$trueDownloadUrl#type=apkm"
-                    } else {
-                        "$trueDownloadUrl#type=apk"
+                    targetRow?.select("a.accent_color")?.attr("href")?.takeIf { it.isNotBlank() }?.let { href ->
+                        val variantUrl = href.toAbsoluteApkMirrorUrl()
+                        Log.d("ReflectDownloader", "[Step 5] Navigating to optimal target variant: $variantUrl")
+                        val res = CloudflareHelper.fetchHtml(variantUrl, userAgent, referer = currentUrl)
+                        currentUrl = res.first
+                        currentDoc = Jsoup.parse(res.second)
                     }
                 }
-            } catch (e: Exception) {}
 
-        if (targetUrl == null) throw Exception("Could not find a download link for $packageName version $version")
-        DownloadUrl(targetUrl!!) to resolvedVersion
+                val downloadBtn = currentDoc.selectFirst(".downloadButton") ?: throw Exception("Download button not found")
+                val intermediatePath = downloadBtn.attr("href").toAbsoluteApkMirrorUrl().substringBefore("&forcebaseapk")
+                
+                val doc2 = Jsoup.parse(CloudflareHelper.fetchHtml(intermediatePath, userAgent, referer = currentUrl).second)
+                val fastLink = doc2.selectFirst("a[href*='/wp-content/themes/APKMirror/download.php']")
+                    ?: doc2.selectFirst("a#download-link")
+                    ?: throw Exception("Fast download link not found")
+
+                val finalPath = fastLink.attr("href").toAbsoluteApkMirrorUrl()
+
+                val finalReq = Request.Builder()
+                    .url(finalPath)
+                    .header("User-Agent", userAgent)
+                    .header("Referer", intermediatePath)
+                    .build()
+
+                var trueDownloadUrl = finalPath
+                CloudflareHelper.noRedirectClient.newCall(finalReq).execute().use { finalRes ->
+                    if (finalRes.isRedirect) {
+                        val loc = finalRes.header("Location")
+                        if (loc != null) trueDownloadUrl = loc.toAbsoluteApkMirrorUrl()
+                    }
+                }
+                
+                val urlPath = try { java.net.URI(trueDownloadUrl).path.lowercase() } catch (e: Exception) { trueDownloadUrl.substringBefore("?").lowercase() }
+                val isApkm = urlPath.endsWith(".apkm") || urlPath.endsWith(".xapk") || urlPath.endsWith(".apks")
+                val formattedUrl = if (isApkm) "$trueDownloadUrl#type=apkm" else "$trueDownloadUrl#type=apk"
+                
+                targetUrl = DownloadUrl(formattedUrl, mapOf("User-Agent" to userAgent))
+                break
+
+            } catch (e: Exception) {
+                Log.e("ReflectDownloader", "Scrape failed", e)
+                if (e.message?.contains("CLOUDFLARE_BLOCK") == true) {
+                    needCaptchaSolve = true
+                    retryCount++
+                } else {
+                    Log.w("ReflectDownloader", "Headless scraping failed/App not found (${e.message}). Breaking to WebView fallback.")
+                    break
+                }
+            }
+        }
+
+        if (targetUrl == null) {
+            Log.d("ReflectDownloader", "Launching fallback WebView...")
+            targetUrl = runWebView("APKMirror") {
+                download { url, _, ua ->
+                    finish(DownloadUrl(url, mapOf("User-Agent" to ua)))
+                }
+                searchUrl
+            }
+        }
+
+        val finalTargetUrl = targetUrl ?: throw Exception("Could not find a download link for $packageName version $version")
+        finalTargetUrl to resolvedVersion 
     }
 
     download { downloadUrl, outputStream ->
-        val isApk = downloadUrl.url.endsWith("#type=apk")
+        val cleanUrl = downloadUrl.url.substringBefore("#")
+        val parsedPath = try { java.net.URI(cleanUrl).path.lowercase() } catch (e: Exception) { "" }
+        val isApk = downloadUrl.url.endsWith("#type=apk") || parsedPath.endsWith(".apk")
         
         if (isApk) {
-            val (inputStream, _) = downloadUrl.toDownloadResult()
+            val (inputStream, size) = downloadUrl.toDownloadResult()
             inputStream.use { stream ->
+                size?.let { reportSize(it) }
                 stream.copyTo(outputStream, 128 * 1024)
             }
         } else {
@@ -185,4 +216,9 @@ val ReflectDownloader = Downloader(R.string.reflect) {
             }
         }
     }
+}
+
+private fun String.toAbsoluteApkMirrorUrl(): String {
+    val unescaped = this.replace("&amp;", "&")
+    return if (unescaped.startsWith("http")) unescaped else "https://www.apkmirror.com$unescaped"
 }
